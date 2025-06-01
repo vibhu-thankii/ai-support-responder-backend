@@ -1,0 +1,22 @@
+[
+    {
+      "id": "kb-1",
+      "keywords": ["return", "policy", "days"],
+      "response": "Our return policy allows for returns up to 30 days after the date of purchase. Please ensure the item is in its original condition and packaging. To initiate a return, please visit the 'Orders' section of your account."
+    },
+    {
+      "id": "kb-2",
+      "keywords": ["damaged", "replacement"],
+      "response": "We are very sorry to hear your item arrived damaged. Please provide your order number and a photo of the damaged item, and we will be happy to process a free replacement for you immediately."
+    },
+    {
+      "id": "kb-3",
+      "keywords": ["login", "password", "credentials"],
+      "response": "If you're having trouble logging in, please first try resetting your password using the 'Forgot Password' link on the login page. If you are still unable to access your account, please let us know the email address you are using."
+    },
+    {
+      "id": "kb-4",
+      "keywords": ["urgent", "critical", "api", "integration", "error"],
+      "response": "This issue has been automatically escalated to our senior technical support team. An agent will get back to you within the next 15-30 minutes. We appreciate your patience as we investigate this critical issue."
+    }
+  ]
