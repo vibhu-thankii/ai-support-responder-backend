@@ -24,7 +24,7 @@ except (FileNotFoundError, json.JSONDecodeError):
 app = FastAPI()
 
 # --- CORS Configuration ---
-origins = ["http://localhost:3000"]
+origins = ["http://localhost:3000","https://ai-support-responder-frontend-fbk6ikkdh-vibhu-thankis-projects.vercel.app"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
