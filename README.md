@@ -85,3 +85,37 @@ pip install -r requirements.txt
 
 # Run the backend server
 uvicorn main:app --reload
+```
+* The backend will be running at http://localhost:8000.
+
+#### 2. **Frontend (`ai-support-responder-frontend`) **
+
+```bash
+# In a new terminal, clone the frontend repository
+git clone [https://github.com/vibhu-thankii/ai-support-responder-frontend.git](https://github.com/vibhu-thankii/ai-support-responder-frontend.git)
+
+# Navigate to the project directory
+cd ai-support-responder-frontend
+
+# Install NPM packages
+npm install
+
+# Run the development server
+npm run dev
+```
+
+* Open http://localhost:3000 with your browser to see the result. The frontend will connect to your local backend server.
+
+---
+
+## Contact
+
+**Vibhu Thanki**
+
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-0077B5?style=for-the-badge&logo=linkedin&logoColor=white)](https://www.linkedin.com/in/vibhu-thankii/)
+
+[![Gmail](https://img.shields.io/badge/Gmail-D14836?style=for-the-badge&logo=gmail&logoColor=white)](mailto:vibhu.thankii@gmai.com)
+
+<br />
+
+**Project Link:** [https://github.com/vibhu-thankii/ai-support-responder-backend](https://github.com/vibhu-thankii/ai-support-responder-backend)
