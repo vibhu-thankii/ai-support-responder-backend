@@ -1,7 +1,7 @@
 # Responder AI - AI-Powered Customer Support Responder
 
 <p align="center">
-  <img src="https://i.imgur.com/gK98h83.png" alt="Responder AI Dashboard" width="100%">
+  <img src="[https://i.imgur.com/gK98h83.png](https://github.com/vibhu-thankii/ai-support-responder-backend/blob/main/ai-support-responder-dashboard.png)" alt="Responder AI Dashboard" width="100%">
 </p>
 
 <p align="center">
