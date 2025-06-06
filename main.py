@@ -201,7 +201,7 @@ app = FastAPI(title="AI Support Responder API", version="1.0.0")
 # Ensure FRONTEND_URL is set in your .env if your frontend is deployed elsewhere
 # Also add FRONTEND_URL_FOR_EMAILS if it's different (e.g. if your app is at app.domain.com and emails link to just domain.com)
 origins = [
-    "http://localhost:3000","https://ai-support-responder-frontend.vercel.app/",
+    "http://localhost:3000","https://ai-support-responder-frontend.vercel.app",
     os.getenv("FRONTEND_URL_FOR_EMAILS"), # For links in emails like accept invitation
     os.getenv("FRONTEND_URL") # For general API calls from the app
 ]
