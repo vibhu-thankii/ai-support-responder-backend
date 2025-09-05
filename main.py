@@ -15,6 +15,9 @@ from gotrue.errors import AuthApiError, AuthUnknownError # Added AuthUnknownErro
 
 from cryptography.fernet import Fernet
 import openai
+import requests  # For Perplexity and Grok API calls
+import anthropic  # For Anthropic Claude API
+import google.generativeai as genai  # For Google Gemini API
 
 # For TF-IDF Fallback
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -84,8 +87,19 @@ class KBEntry(BaseModel): # For responses, especially from GET /api/knowledge-ba
     # embedding: Optional[List[float]] = None # Embedding not usually sent to frontend list
     created_at: datetime # Changed from Optional[Any]
 
-class APISettings(BaseModel):
-    openai_api_key: str
+class MultiAPISettings(BaseModel):
+    openai_api_key: Optional[str] = None
+    gemini_api_key: Optional[str] = None
+    grok_api_key: Optional[str] = None
+    perplexity_api_key: Optional[str] = None
+    anthropic_api_key: Optional[str] = None
+
+class APIKeyStatusResponse(BaseModel):
+    openai: bool
+    gemini: bool
+    grok: bool
+    perplexity: bool
+    anthropic: bool    
 
 class OrganizationCreateRequest(BaseModel):
     name: str
@@ -194,6 +208,17 @@ class PendingInvitation(BaseModel): # For listing pending invites
     expires_at: datetime
     invited_by_user_id: Optional[UUID] = None
 
+    # Add this class to the end of the file
+
+class CustomerResponse(BaseModel):
+    email: str
+    name: Optional[str] = None
+    total_queries: int
+    last_contact: Optional[datetime] = None
+
+class SingleAPISetting(BaseModel):
+    provider: str  # e.g., "openai", "gemini", etc.
+    api_key: str
 #--- FastAPI App Initialization ---
 app = FastAPI(title="AI Support Responder API", version="1.0.0")
 
@@ -218,33 +243,58 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-#--- Helper: Get Decrypted OpenAI API Key ---
-async def get_decrypted_openai_api_key(org_id: UUID, admin_client: Client) -> Optional[str]:
+
+# Add this new helper function to main.py
+
+async def get_active_api_key(org_id: UUID, admin_client: Client) -> Optional[tuple[str, str]]:
+    """
+    Finds the first available and decrypted API key from a list of providers.
+    Returns a tuple of (provider_name, api_key) or (None, None).
+    """
+    provider_columns = {
+        "openai": "openai_api_key_encrypted",
+        "gemini": "gemini_api_key_encrypted",
+        "anthropic": "anthropic_api_key_encrypted",
+        "grok": "grok_api_key_encrypted",
+        "perplexity": "perplexity_api_key_encrypted",
+    }
+    
+    columns_to_select = ", ".join(provider_columns.values()) + ", encryption_key"
+
     try:
         settings_response = (
             admin_client.table("organization_settings")
-            .select("openai_api_key_encrypted, encryption_key")
+            .select(columns_to_select)
             .eq("organization_id", str(org_id))
-            .maybe_single() # Use maybe_single to gracefully handle no settings
+            .maybe_single()
             .execute()
         )
 
-        if settings_response.data: # Check if data exists and is not None
-            encrypted_api_key = settings_response.data.get("openai_api_key_encrypted")
-            encryption_key_str = settings_response.data.get("encryption_key")
-            if encrypted_api_key and encryption_key_str:
-                key_bytes = encryption_key_str.encode()
-                decrypted_key = decrypt_data(encrypted_api_key, key_bytes)
-                return decrypted_key
-        else:
-            # This case means no settings row was found for the org_id, or the row was empty
-            print(f"API_KEY_HELPER: No settings found for org {org_id}, or data is None/empty.")
-            
-    except APIError as e: # Catch PostgREST errors specifically
-        print(f"API_KEY_HELPER: Supabase APIError fetching API key for org {org_id}: {e}")
-    except Exception as e: # Catch other errors like decryption issues
-        print(f"API_KEY_HELPER: Decryption or other error fetching API key for org {org_id}: {e}")
-    return None
+        if not settings_response.data:
+            return None, None
+
+        settings = settings_response.data
+        encryption_key_str = settings.get("encryption_key")
+        if not encryption_key_str:
+            return None, None
+        
+        key_bytes = encryption_key_str.encode()
+
+        for provider, column in provider_columns.items():
+            encrypted_key = settings.get(column)
+            if encrypted_key:
+                try:
+                    decrypted_key = decrypt_data(encrypted_key, key_bytes)
+                    print(f"ACTIVE_API_KEY: Found and decrypted key for provider: {provider}")
+                    return provider, decrypted_key
+                except Exception as e:
+                    print(f"ACTIVE_API_KEY: Failed to decrypt key for {provider}: {e}")
+                    continue
+
+    except Exception as e:
+        print(f"ACTIVE_API_KEY: General error fetching API key for org {org_id}: {e}")
+        
+    return None, None
 
 
 #--- Dependency for getting the current user from JWT ---
@@ -493,15 +543,11 @@ async def create_invitation(
             raise HTTPException(status_code=400, detail=f"An active invitation already exists for {invitee_email} for this organization.")
 
         # Check if a user with this email is already a member of THIS organization.
-        # This requires joining auth.users with profiles. We can use an RPC function for this.
-        # For simplicity here, we assume if `list_users` finds a user, and their profile has this org_id, they are a member.
-        # This is a simplified check. A dedicated DB function would be more robust.
-        
-        # Corrected way to check if user with this email exists:
-        existing_users_response = supabase_admin.auth.admin.list_users(page=1, per_page=10) # Fetch users; no direct email filter here in v2 of gotrue-py for admin
+        existing_users_response = supabase_admin.auth.admin.list_users(page=1, per_page=10) # Fetch users
         
         found_existing_user_in_org = False
-        if existing_users_response and existing_users_response.users:
+        # CORRECTED PART: Iterate directly over the list of users in the response object
+        if existing_users_response and hasattr(existing_users_response, 'users'):
             for user_in_auth in existing_users_response.users:
                 if user_in_auth.email and user_in_auth.email.lower() == invitee_email:
                     # User with this email exists in auth.users. Now check their profile for this org.
@@ -548,7 +594,7 @@ async def create_invitation(
             "invited_by_user_id": str(invited_by_user_id)
         }
         
-        insert_response = supabase_admin.table("invitations").insert(invitation_payload).execute() # Removed .select()
+        insert_response = supabase_admin.table("invitations").insert(invitation_payload).execute()
 
         if not insert_response.data: # Check for error on insert
             raise APIError({"message": "Failed to save invitation or no data returned."}) # Raise to be caught
@@ -593,10 +639,8 @@ async def create_invitation(
         if not email_sent:
             # Even if email fails, the invite is in the DB. Admin might need to resend/notify.
             print(f"INVITE: Failed to send invitation email to {invitee_email}, but invitation record created.")
-            # Depending on policy, you might raise an error here or just log it.
-            # For now, we return the created invitation data.
 
-        return InvitationDB(**created_invitation_data) # Use Pydantic model for response
+        return InvitationDB(**created_invitation_data)
 
     except APIError as e: # Catch PostgREST errors specifically
         print(f"INVITE: DB error during invitation process: {e.json() if hasattr(e, 'json') else str(e)}")
@@ -854,47 +898,70 @@ async def get_pending_invitations(
 
 
 #--- API Key Management Endpoints ---
-@app.post("/api/settings/api-key")
+@app.post("/api/settings/api-keys")
 async def save_api_key(
-    settings: APISettings,
+    setting: SingleAPISetting,
     current_user: AuthenticatedUser = Depends(get_current_user_with_org_dependency)
 ):
-    org_id = current_user.organization_id # Ensured by dependency
-    encryption_k_bytes = generate_encryption_key()
-    encrypted_api_key = encrypt_data(settings.openai_api_key, encryption_k_bytes)
+    org_id = str(current_user.organization_id)
+    key_bytes = generate_encryption_key()
+    
+    provider_to_column = {
+        "openai": "openai_api_key_encrypted",
+        "gemini": "gemini_api_key_encrypted",
+        "grok": "grok_api_key_encrypted",
+        "perplexity": "perplexity_api_key_encrypted",
+        "anthropic": "anthropic_api_key_encrypted",
+    }
+
+    column_name = provider_to_column.get(setting.provider)
+    if not column_name:
+        raise HTTPException(status_code=400, detail="Invalid AI provider specified.")
+
+    encrypted_key = encrypt_data(setting.api_key, key_bytes)
     
     payload_to_upsert = {
-        "organization_id": str(org_id),
-        "openai_api_key_encrypted": encrypted_api_key,
-        "encryption_key": encryption_k_bytes.decode(), # Store the key as string
+        "organization_id": org_id,
+        column_name: encrypted_key,
+        "encryption_key": key_bytes.decode()
     }
-    print(f"Attempting to upsert API key for org: {org_id}")
+
     try:
-        db_response = (
-            supabase_admin.table("organization_settings")
-            .upsert(payload_to_upsert, on_conflict="organization_id") # Assumes organization_id has a UNIQUE constraint
-            .execute()
+        # FIX: Added on_conflict="organization_id" to ensure it updates the existing row
+        supabase_admin.table("organization_settings").upsert(
+            payload_to_upsert, on_conflict="organization_id"
+        ).execute()
+        
+        return {"message": f"{setting.provider.capitalize()} API key saved successfully"}
+    except Exception as e:
+        print(f"Error saving API key for {setting.provider}: {e}")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred while saving the API key.")
+
+@app.get("/api/settings/api-key-status", response_model=APIKeyStatusResponse)
+async def get_api_key_status(
+    current_user: AuthenticatedUser = Depends(get_current_user_with_org_dependency)
+):
+    org_id = str(current_user.organization_id)
+    try:
+        response = supabase_admin.table("organization_settings").select(
+            "openai_api_key_encrypted, gemini_api_key_encrypted, grok_api_key_encrypted, perplexity_api_key_encrypted, anthropic_api_key_encrypted"
+        ).eq("organization_id", org_id).maybe_single().execute()
+
+        if not response.data:
+            return APIKeyStatusResponse(openai=False, gemini=False, grok=False, perplexity=False, anthropic=False)
+
+        settings = response.data
+        return APIKeyStatusResponse(
+            openai=bool(settings.get("openai_api_key_encrypted")),
+            gemini=bool(settings.get("gemini_api_key_encrypted")),
+            grok=bool(settings.get("grok_api_key_encrypted")),
+            perplexity=bool(settings.get("perplexity_api_key_encrypted")),
+            anthropic=bool(settings.get("anthropic_api_key_encrypted")),
         )
-        # For upsert, PostgREST might return empty data on successful update/insert if return=minimal
-        # A successful operation might not always have data if that's the PostgREST config.
-        # Check for error presence first.
-        if hasattr(db_response, 'error') and db_response.error:
-            error_message = db_response.error.message
-            print(f"API key upsert failed for org {org_id}. Error: {error_message}")
-            raise HTTPException(status_code=500, detail=f"Failed to save API key: {error_message}")
-
-        print(f"API key upsert successful for org {org_id}. Response data: {db_response.data}")
-        return {"message": "API key saved successfully"}
-
-    except APIError as e: # Catch PostgREST specific errors
-        print(f"APIError saving API key for org {org_id}: {e}")
-        # Try to use PostgREST error code if available
-        status_code = e.code if hasattr(e, 'code') and isinstance(e.code, int) else 500
-        raise HTTPException(status_code=status_code, detail=f"Database error saving API key: {e.message}")
-    except Exception as e: # Catch other errors like during encryption
-        print(f"Unexpected error saving API key for org {org_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Unexpected error saving API key: {str(e)}")
-
+    except Exception as e:
+        print(f"Error fetching API key status: {e}")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred while fetching API key status: {str(e)}")
+    
 
 #--- Knowledge Base Endpoints ---
 @app.post("/api/knowledge-base/ingest", response_model=KBEntry)
@@ -906,7 +973,7 @@ async def ingest_knowledge_base_content(
     content_to_ingest = request_data.content
     embedding_vector = None # Will store the generated embedding
     
-    decrypted_api_key = await get_decrypted_openai_api_key(org_id, supabase_admin)
+    decrypted_api_key = await get_active_api_key(org_id, supabase_admin)
 
     if decrypted_api_key:
         try:
@@ -1041,78 +1108,91 @@ async def delete_knowledge_base_entry(
 
 
 #--- AI Response Generation Endpoint ---
+# Replace the existing generate_ai_response_rag function in main.py with this one
+
 @app.post("/api/generate-response", response_model=RAGResponse)
 async def generate_ai_response_rag(
     request_data: QueryRequest,
     current_user: AuthenticatedUser = Depends(get_current_user_with_org_dependency)
 ):
-    org_id = current_user.organization_id # Ensured by dependency
+    org_id = current_user.organization_id
     customer_query = request_data.text
-    retrieved_context_count = 0
-    response_source = "tfidf_failed" # Default pessimistic source
 
-    # 1. Check if knowledge base is empty for this organization
-    kb_entry_count = 0
+    # 1. Check if knowledge base is empty
     try:
         kb_check_response = (
             supabase_admin.table("knowledge_base_entries")
-            .select("id", count="exact") # Request only count for efficiency
+            .select("id", count="exact")
             .eq("organization_id", str(org_id))
-            .limit(1) # We only need to know if at least one exists
+            .limit(1)
             .execute()
         )
-        # The count is available in kb_check_response.count if using supabase-py v1.x with PostgREST count header
         kb_entry_count = kb_check_response.count if kb_check_response.count is not None else 0
-        print(f"KB check for org {org_id}: Found {kb_entry_count} entries.")
-
         if kb_entry_count == 0:
             return RAGResponse(
-                generated_response="The knowledge base for this organization is currently empty. Please ingest content to enable AI responses.",
+                generated_response="The knowledge base is empty. Please add content to enable AI responses.",
                 retrieved_context_count=0,
                 source="no_kb_content"
             )
-    except APIError as e: # Catch PostgREST errors
-        print(f"APIError checking knowledge base for org {org_id}: {e}")
-        # If KB check fails, we might still proceed to TF-IDF which will also fail but more gracefully
-    except Exception as e: # Catch other unexpected errors
-        print(f"Unexpected error checking knowledge base for org {org_id}: {e}")
-        # Proceed cautiously, TF-IDF/RAG will likely fail or use default response
+    except Exception as e:
+        print(f"Error checking knowledge base for org {org_id}: {e}")
+        # Fallback to TF-IDF if KB check fails but there might be data
+        pass
 
-    # 2. Attempt to get OpenAI API key and use OpenAI RAG
-    decrypted_api_key = await get_decrypted_openai_api_key(org_id, supabase_admin)
+    # 2. Attempt to get an active API key from any provider
+    active_provider, decrypted_api_key = await get_active_api_key(org_id, supabase_admin)
 
-    if decrypted_api_key:
+    if active_provider and decrypted_api_key:
         try:
-            print(f"OPENAI_RAG: Attempting OpenAI RAG for org {org_id}")
-            openai_client = openai.OpenAI(api_key=decrypted_api_key)
+            print(f"AI_RAG: Attempting RAG pipeline for org {org_id} using {active_provider}")
             
-            # Generate embedding for the customer query
-            embedding_response = openai_client.embeddings.create(
-                input=customer_query,
-                model="text-embedding-ada-002" # OpenAI's recommended embedding model
-            )
-            query_embedding = embedding_response.data[0].embedding
+            # Get embeddings and context (using OpenAI for embeddings for now)
+            query_embedding = None
+            context_for_prompt = ""
+            retrieved_context_count = 0
+            
+            # Generate embeddings using OpenAI (you might want to make this provider-agnostic later)
+            if active_provider == "openai":
+                openai_client = openai.OpenAI(api_key=decrypted_api_key)
+                embedding_response = openai_client.embeddings.create(
+                    input=customer_query, model="text-embedding-ada-002"
+                )
+                query_embedding = embedding_response.data[0].embedding
+            else:
+                # For other providers, we'll skip embeddings and use TF-IDF for context retrieval
+                print(f"AI_RAG: Skipping OpenAI embeddings for provider {active_provider}, will use basic context matching")
 
-            # Call the Supabase Edge Function/RPC for matching documents
-            match_response = supabase_admin.rpc(
-                "match_documents", # Ensure this function name matches what you created in Supabase
-                {
-                    "p_query_embedding": query_embedding,
-                    "p_match_threshold": 0.7, # Adjust as needed for relevance
-                    "p_match_count": 3,       # Number of context chunks to retrieve
-                    "p_org_id": str(org_id)
-                }
-            ).execute()
-
-            if match_response.data: # Check if RPC returned any matching documents
-                retrieved_context_count = len(match_response.data)
-                print(f"OPENAI_RAG: Found {retrieved_context_count} relevant documents for org {org_id}")
-                context_for_prompt = "\n\n---\n\n".join([doc["content"] for doc in match_response.data])
+            # Get context from knowledge base
+            if query_embedding:
+                # Use vector similarity search
+                match_response = supabase_admin.rpc(
+                    "match_documents",
+                    {
+                        "p_query_embedding": query_embedding,
+                        "p_match_threshold": 0.7,
+                        "p_match_count": 3,
+                        "p_org_id": str(org_id)
+                    }
+                ).execute()
                 
-                # Construct a prompt for the language model
-                prompt = f"""You are a helpful AI customer support agent for an organization. 
-Based on the following information from the organization's knowledge base, answer the customer's query. 
-If the information isn't sufficient, politely state that you couldn't find a specific answer.
+                if match_response.data:
+                    context_for_prompt = "\n\n---\n\n".join([doc["content"] for doc in match_response.data])
+                    retrieved_context_count = len(match_response.data)
+            else:
+                # Fallback to simple text matching for non-OpenAI providers
+                kb_entries_response = (
+                    supabase_admin.table("knowledge_base_entries")
+                    .select("content")
+                    .eq("organization_id", str(org_id))
+                    .limit(3)  # Get top 3 entries as basic context
+                    .execute()
+                )
+                if kb_entries_response.data:
+                    context_for_prompt = "\n\n---\n\n".join([entry["content"] for entry in kb_entries_response.data])
+                    retrieved_context_count = len(kb_entries_response.data)
+
+            # Create the prompt
+            prompt = f"""You are a helpful AI customer support agent. Based on the following information, answer the customer's query. If the information isn't sufficient, politely state that you couldn't find a specific answer.
 
 Knowledge Base Context:
 ---
@@ -1122,114 +1202,132 @@ Knowledge Base Context:
 Customer Query: "{customer_query}"
 
 Answer:"""
-                
-                # Call OpenAI's chat completion API
+
+            # Generate response based on provider
+            generated_text = ""
+            
+            if active_provider == "openai":
+                openai_client = openai.OpenAI(api_key=decrypted_api_key)
                 chat_completion_response = openai_client.chat.completions.create(
-                    model="gpt-3.5-turbo", # Or your preferred model like gpt-4
+                    model="gpt-3.5-turbo",
                     messages=[
                         {"role": "system", "content": "You are a helpful customer support assistant."},
                         {"role": "user", "content": prompt},
                     ],
-                    temperature=0.3, # Lower temperature for more factual, less creative responses
+                    temperature=0.3,
                 )
                 generated_text = chat_completion_response.choices[0].message.content.strip()
-                response_source = "openai_rag"
-                return RAGResponse(generated_response=generated_text, retrieved_context_count=retrieved_context_count, source=response_source)
+                
+            elif active_provider == "anthropic":
+                anthropic_client = anthropic.Anthropic(api_key=decrypted_api_key)
+                response = anthropic_client.messages.create(
+                    model="claude-3-sonnet-20240229",
+                    max_tokens=1000,
+                    temperature=0.3,
+                    messages=[
+                        {"role": "user", "content": prompt}
+                    ]
+                )
+                generated_text = response.content[0].text.strip()
+                
+            elif active_provider == "gemini":
+                genai.configure(api_key=decrypted_api_key)
+                model = genai.GenerativeModel('gemini-1.5-flash')
+                response = model.generate_content(prompt)
+                generated_text = response.text.strip()
+                
+            elif active_provider == "perplexity":
+                headers = {
+                    "Authorization": f"Bearer {decrypted_api_key}",
+                    "Content-Type": "application/json"
+                }
+                data = {
+                    "model": "llama-3.1-sonar-small-128k-online",
+                    "messages": [
+                        {"role": "system", "content": "You are a helpful customer support assistant."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "temperature": 0.3
+                }
+                response = requests.post("https://api.perplexity.ai/chat/completions", 
+                                       headers=headers, json=data)
+                if response.status_code == 200:
+                    generated_text = response.json()["choices"][0]["message"]["content"].strip()
+                else:
+                    raise Exception(f"Perplexity API error: {response.status_code}")
+                    
+            elif active_provider == "grok":
+                headers = {
+                    "Authorization": f"Bearer {decrypted_api_key}",
+                    "Content-Type": "application/json"
+                }
+                data = {
+                    "messages": [
+                        {"role": "system", "content": "You are a helpful customer support assistant."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "model": "grok-beta",
+                    "temperature": 0.3
+                }
+                response = requests.post("https://api.x.ai/v1/chat/completions", 
+                                       headers=headers, json=data)
+                if response.status_code == 200:
+                    generated_text = response.json()["choices"][0]["message"]["content"].strip()
+                else:
+                    raise Exception(f"Grok API error: {response.status_code}")
+            
             else:
-                # No relevant documents found by vector search
-                print(f"OPENAI_RAG: No relevant documents found for query from org {org_id}")
-                response_source = "openai_rag_no_context" # Will fall through to TF-IDF or generic
-        
-        except openai.APIError as e: # Catch OpenAI specific API errors (quota, auth, etc.)
-            print(f"OpenAI API error during RAG generation for org {org_id} (falling back to TF-IDF if possible): {e}")
-            # Log the error but allow fallback to TF-IDF
-        except Exception as e: # Catch other unexpected errors during OpenAI RAG
-            print(f"Unexpected error during OpenAI RAG for org {org_id} (falling back to TF-IDF if possible): {e}")
-            # Log error, allow TF-IDF fallback
-    else:
-        print(f"No OpenAI API key for org {org_id}. Attempting TF-IDF fallback.")
-
-    # 3. TF-IDF Fallback (if OpenAI RAG failed or no key, and KB is not empty)
-    # This part will only run if kb_entry_count > 0 AND (decrypted_api_key is None OR OpenAI RAG failed/found no context)
-    if kb_entry_count > 0 : # Ensure we only run TF-IDF if there's content
-        try:
-            print(f"TFIDF_FALLBACK: Attempting TF-IDF for org {org_id}")
-            # Fetch all documents for TF-IDF vectorization
-            kb_entries_response = (
-                supabase_admin.table("knowledge_base_entries")
-                .select("id, content") # Only need content for TF-IDF
-                .eq("organization_id", str(org_id))
-                .execute()
+                raise Exception(f"Unsupported provider: {active_provider}")
+                
+            return RAGResponse(
+                generated_response=generated_text, 
+                retrieved_context_count=retrieved_context_count, 
+                source=f"{active_provider}_rag"
             )
-
-            if kb_entries_response.data and len(kb_entries_response.data) > 0:
-                documents = [entry["content"] for entry in kb_entries_response.data]
-                
-                if not documents: # Should not happen if kb_entries_response.data is checked
-                    raise ValueError("No documents found for TF-IDF (should have been caught by kb_entry_count).")
-
-                # Create TF-IDF matrix
-                vectorizer = TfidfVectorizer(stop_words='english')
-                tfidf_matrix = vectorizer.fit_transform(documents)
-                
-                # Transform the customer query
-                query_tfidf_vector = vectorizer.transform([customer_query])
-                
-                # Calculate cosine similarities
-                cosine_similarities = cosine_similarity(query_tfidf_vector, tfidf_matrix).flatten()
-                
-                num_matches_to_retrieve = min(3, len(documents)) # Get top 3 or fewer
-                
-                # Get indices of top N matches above a certain threshold
-                # Filter out matches below the threshold first
-                potential_matches_indices = np.where(cosine_similarities > 0.1)[0] # Example threshold, adjust as needed
-                
-                if len(potential_matches_indices) > 0:
-                    # Sort these potential matches by similarity score
-                    sorted_potential_matches = sorted(potential_matches_indices, key=lambda i: cosine_similarities[i], reverse=True)
-                    top_match_indices = sorted_potential_matches[:num_matches_to_retrieve]
-                    
-                    relevant_snippets = [documents[i] for i in top_match_indices]
-                    retrieved_context_count = len(relevant_snippets)
-                    
-                    if relevant_snippets:
-                        combined_snippets = "\n\n---\n\n".join(relevant_snippets) # Join snippets with a separator
-                        fallback_response_text = (
-                            f"Based on the knowledge base, here's some information that might be relevant:\n\n"
-                            f"{combined_snippets}"
-                        )
-                        response_source = "tfidf_retrieval"
-                        return RAGResponse(generated_response=fallback_response_text, retrieved_context_count=retrieved_context_count, source=response_source)
-                    else: # Threshold was too high, or no good matches after sorting (unlikely if potential_matches_indices > 0)
-                        response_source = "tfidf_retrieval_no_match"
-                else: # No matches above the threshold
-                    response_source = "tfidf_retrieval_no_match"
-            else: # No documents fetched for TF-IDF (should be caught by kb_entry_count)
-                response_source = "tfidf_retrieval_failed" # Indicate failure to retrieve docs for TF-IDF
-                print(f"TF-IDF: No knowledge base content found for org {org_id} for TF-IDF processing.")
-
+            
         except Exception as e:
-            print(f"Error during TF-IDF fallback for org {org_id}: {e}")
-            response_source = "tfidf_failed" # Mark as failed if TF-IDF itself errors
+            print(f"AI RAG pipeline failed for org {org_id} with provider {active_provider}: {e}")
+            # Fall through to TF-IDF on failure
+    else:
+        print(f"No active/valid API key found for org {org_id}. Attempting TF-IDF fallback.")
 
-    # 4. Generic Fallback if all else fails (including if KB was empty and initial check somehow bypassed)
-    # Determine the most accurate final source based on what happened
-    final_source = response_source # Start with the last known source
-    
-    # Re-check kb_entry_count for the most accurate final message if all methods failed
-    # This simple re-check assumes the initial kb_entry_count is still valid.
-    # A more robust way might involve passing a flag from the initial check.
-    if kb_entry_count == 0: # This implies the initial check passed but somehow we are here, or it was an error
-        final_generated_response = "The knowledge base for this organization is currently empty. Please ingest content to enable AI responses."
-        final_source = "no_kb_content"
-    elif response_source in ["openai_rag_no_context", "tfidf_retrieval_no_match"]:
-        final_generated_response = "I found some information in the knowledge base, but it might not be specific enough to answer your query. A team member will review it."
-    elif response_source in ["tfidf_failed", "tfidf_retrieval_failed"]: # TF-IDF errored or found no docs
-        final_generated_response = "I'm having a little trouble searching the knowledge base right now. A team member will review your query."
-    else: # Default generic if no other condition met (should ideally be one of the above)
-        final_generated_response = "I'm sorry, I couldn't find a specific answer at the moment. A team member will review your query."
+    # 3. TF-IDF Fallback (if no API key or AI call fails)
+    try:
+        print(f"TFIDF_FALLBACK: Attempting TF-IDF for org {org_id}")
+        kb_entries_response = (
+            supabase_admin.table("knowledge_base_entries")
+            .select("id, content")
+            .eq("organization_id", str(org_id))
+            .execute()
+        )
+        if kb_entries_response.data:
+            documents = [entry["content"] for entry in kb_entries_response.data]
+            vectorizer = TfidfVectorizer(stop_words='english')
+            tfidf_matrix = vectorizer.fit_transform(documents)
+            query_tfidf_vector = vectorizer.transform([customer_query])
+            cosine_similarities = cosine_similarity(query_tfidf_vector, tfidf_matrix).flatten()
+            num_matches_to_retrieve = min(3, len(documents))
+            potential_matches_indices = np.where(cosine_similarities > 0.1)[0]
+            if len(potential_matches_indices) > 0:
+                sorted_potential_matches = sorted(potential_matches_indices, key=lambda i: cosine_similarities[i], reverse=True)
+                top_match_indices = sorted_potential_matches[:num_matches_to_retrieve]
+                relevant_snippets = [documents[i] for i in top_match_indices]
+                if relevant_snippets:
+                    combined_snippets = "\n\n---\n\n".join(relevant_snippets)
+                    fallback_response_text = (
+                        f"Based on the knowledge base, here's some information that might be relevant:\n\n"
+                        f"{combined_snippets}"
+                    )
+                    return RAGResponse(generated_response=fallback_response_text, retrieved_context_count=len(relevant_snippets), source="tfidf_retrieval")
+    except Exception as e:
+        print(f"Error during TF-IDF fallback for org {org_id}: {e}")
 
-    return RAGResponse(generated_response=final_generated_response, retrieved_context_count=0, source=final_source)
+    # Generic Fallback if all else fails
+    return RAGResponse(
+        generated_response="I'm sorry, I couldn't find a specific answer at the moment. A team member will review your query.",
+        retrieved_context_count=0,
+        source="tfidf_failed"
+    )
 
 #--- Email Webhook Endpoint ---
 @app.post("/api/email/inbound-webhook")
@@ -1894,6 +1992,24 @@ async def get_query_volume(
         print(f"DASHBOARD_VOLUME: Unexpected error fetching query volume for org {org_id}: {type(e).__name__} - {e}")
         raise HTTPException(status_code=500, detail=f"Unexpected error fetching query volume: {str(e)}")
 
+#--- New Endpoint to Fetch Customers for the Organization ---
+@app.get("/api/customers", response_model=List[CustomerResponse])
+async def get_customers(
+    current_user: AuthenticatedUser = Depends(get_current_user_with_org_dependency)
+):
+    org_id = current_user.organization_id
+    try:
+        response = supabase_admin.rpc(
+            "get_customers_for_organization", {"org_id": str(org_id)}
+        ).execute()
+        
+        return response.data if response.data else []
+    except APIError as e:
+        print(f"APIError fetching customers for org {org_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not fetch customers: {e.message}")
+    except Exception as e:
+        print(f"Unexpected error fetching customers for org {org_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Unexpected error fetching customers: {str(e)}")
 
 #--- Placeholder for running the app with Uvicorn (for local development) ---
 # if __name__ == "__main__":
